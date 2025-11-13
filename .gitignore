@@ -1,0 +1,14 @@
+# Python/FastAPI
+__pycache__/
+.venv/
+venv/
+*.pyc
+.env
+
+# Node/SvelteKit
+/node_modules
+.svelte-kit/
+/build
+
+# IDE files (optional)
+.vscode/

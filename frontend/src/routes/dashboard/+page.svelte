@@ -136,14 +136,19 @@
     }
 
     //API logic
+    let analysisRunning = false;
     let analysisError = null;
+    let lastVideoPreview = videoPreview;
 
     async function startAnalysis(e) {
         e.preventDefault();
         analysisError = null;
+        analysisRunning = true;
+        videoPreview = null;
 
         if (loading || !authToken) {
             analysisError = "Authentication not ready. Please wait.";
+            analysisRunning = false;
             return;
         }
 
@@ -154,12 +159,12 @@
             urlToSend = youtubeLinkOrQuery;
         } else {
             console.log("No URL provided");
+            analysisRunning = false;
             return;
         }
 
         try {
             isSearching = true;
-
             const res = await fetch(`${apiUrl}/audio/process`, {
                 method: "POST",
                 headers: {
@@ -187,19 +192,22 @@
             eventSource.onmessage = (event) => {
                 progress = event.data;
 
-                if (progress === "finalizing") {
+                if (progress === "done") {
                     eventSource.close();
+                    analysisRunning = false;
                 }
             };
 
             eventSource.onerror = () => {
                 console.error("SSE connection lost");
                 eventSource.close();
+                analysisRunning = false;
             };
         } catch (error) {
             analysisError =
                 analysisError || "Could not connect to the API server.";
             console.error(error);
+            analysisRunning = false;
         } finally {
             isSearching = false;
         }
@@ -209,7 +217,7 @@
     let progress = null;
     let eventSource = null;
 
-    const progressSteps = ["downloading", "separating", "finalizing"];
+    const progressSteps = ["downloading", "separating", "finalizing", "done"];
 
     function progressPercentage(step) {
         const index = progressSteps.indexOf(step);
@@ -234,7 +242,6 @@
             >
         </div>
     {:else}
-        <!-- The form content is only visible and interactable when loading is false -->
         <form
             on:submit={startAnalysis}
             class="flex items-start w-1/2 max-w-3xl mx-auto space-x-2"
@@ -274,39 +281,10 @@
                         </div>
                     {/if}
 
-                    {#if videoPreview && isUrl}
+                    {#if !analysisRunning && videoPreview && isUrl}
                         <div
                             class="flex flex-col p-3 space-y-1 bg-fuchsia-50 border-t-4 border-fuchsia-600"
                         >
-                            {#if progress}
-                                <div class="w-1/2 max-w-3xl mx-auto mt-6">
-                                    <p
-                                        class="text-sm text-gray-600 mb-1 capitalize"
-                                    >
-                                        {progress}
-                                    </p>
-
-                                    <div
-                                        class="w-full bg-gray-200 rounded-full h-4 overflow-hidden"
-                                    >
-                                        <div
-                                            class="bg-fuchsia-400 h-4 transition-all duration-300"
-                                            style="width: {progressPercentage(
-                                                progress,
-                                            )}%"
-                                        ></div>
-                                    </div>
-
-                                    {#if progress === "done"}
-                                        <p
-                                            class="text-green-600 mt-2 font-semibold"
-                                        >
-                                            Processing complete!
-                                        </p>
-                                    {/if}
-                                </div>
-                            {/if}
-
                             <div class="flex gap-2">
                                 <div class="img-wrapper">
                                     <img
@@ -377,6 +355,39 @@
                             {/each}
                         </ul>
                     {/if}
+
+                    {#if progress}
+                        <div class="progress-wrapper p-2">
+                            {#if progress !== "done"}
+                                <div class="flex justify-start m-2">
+                                    <span
+                                        class="text-sm font-medium text-semibold capitalize"
+                                        >{progress}...</span
+                                    >
+                                </div>
+                                <div
+                                    class="w-full bg-gray-200 rounded-full h-4"
+                                >
+                                    <div
+                                        class="glass-progress-bar h-4 flex items-center justify-center rounded-full text-xs font-medium text-white text-center p-0.5 leading-none"
+                                        style="width: {Math.max(
+                                            progressPercentage(progress),
+                                            8,
+                                        )}%;"
+                                    >
+                                        {progressPercentage(progress)}%
+                                        <span class="shine"></span>
+                                    </div>
+                                </div>
+                            {/if}
+
+                            {#if progress === "done"}
+                                <p class="text-green-600 mt-2 font-semibold">
+                                    Processing complete!
+                                </p>
+                            {/if}
+                        </div>
+                    {/if}
                 </div>
             </div>
 
@@ -384,7 +395,7 @@
                 on:click={startAnalysis}
                 type="submit"
                 class="inline-flex items-center justify-center shrink-0 text-white bg-fuchsia-400 hover:bg-fuchsia-500 focus:ring-4 focus:ring-fuchsia-300 shadow-xs rounded w-10 h-10 focus:outline-none cursor-pointer transition disabled:bg-gray-400"
-                disabled={isSearching || !authToken}
+                disabled={isSearching || analysisRunning || !authToken}
             >
                 <Icon icon="material-symbols:search-rounded" class="w-6 h-6" />
             </button>
@@ -405,3 +416,34 @@
         {/if}
     {/if}
 </div>
+
+<style>
+    .glass-progress-bar {
+        position: relative;
+        background: linear-gradient(90deg, #e879f9 80%, #e879f9 100%);
+        overflow: hidden;
+    }
+    .glass-progress-bar .shine {
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 50%;
+        height: 100%;
+        clip-path: polygon(20% 0, 100% 0, 80% 100%, 0% 100%);
+        pointer-events: none;
+        background: linear-gradient(
+            90deg,
+            rgba(255, 255, 255, 0.5) 0%,
+            rgba(255, 255, 255, 0.45) 100%
+        );
+        animation: shine-move 1s infinite linear;
+    }
+    @keyframes shine-move {
+        0% {
+            left: -100%;
+        }
+        100% {
+            left: 100%;
+        }
+    }
+</style>

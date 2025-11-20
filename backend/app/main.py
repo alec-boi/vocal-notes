@@ -8,10 +8,12 @@ from fastapi.responses import StreamingResponse
 from supabase import create_client
 from pydantic import BaseModel
 from audio_separator.separator import Separator
+from time import sleep
 import yt_dlp
 import uuid
 import jwt
 import requests
+import threading
 import asyncio
 
 load_dotenv()
@@ -97,13 +99,12 @@ def logout():
 
 
 @app.post("/audio/process")
-async def process_audio(payload: UrlPayload, user=Depends(verify_token)):
+def process_audio(payload: UrlPayload, user=Depends(verify_token)):
     task_id = str(uuid.uuid4())
-
-    asyncio.create_task(
-        process_audio_task(payload.url, user.id, task_id)
+    thread = threading.Thread(
+        target=process_audio_task, args=(payload.url, user.id, task_id)
     )
-
+    thread.start()
     return {"task_id": task_id}
 
 
@@ -117,6 +118,10 @@ def process_audio_task(input_path, uid, task_id):
     vocals = separate_voiceline(file_path, uid)
 
     progress_store[task_id] = "finalizing"
+
+    sleep(5)
+
+    progress_store[task_id] = "done"
     return vocals
 
 
@@ -157,10 +162,6 @@ def download_audio(url: str, uid: str) -> str:
 
 
 def separate_voiceline(input_path: str, uid: str):
-    # I don't think these are required for production but my PC couldn't handle it so I had to add these
-    # both these and the model chosen prioritize not destroying my PC in a detriment to performance so,
-    # with an actual server it would probably be faster and consequently much better
-
     os.environ["OMP_NUM_THREADS"] = "4"
     os.environ["UVR_THREADS"] = "4"
     os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
@@ -204,10 +205,6 @@ def separate_voiceline(input_path: str, uid: str):
             return None
 
     return vocals_path
-
-
-# yes, I, in fact, did not program this by myself but I doubt a singular programmer that is not a Youtube technician or something like that
-# will bother to learn their API nowadays, and just looking at this, I mean... Jesus H. Fucking Christ...
 
 
 @app.get("/youtube/details", dependencies=[Depends(security)])

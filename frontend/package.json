@@ -14,7 +14,9 @@
 		"prepare": "svelte-kit sync || echo ''"
 	},
 	"dependencies": {
-		"@supabase/supabase-js": "^2.81.1"
+		"@iconify/svelte": "^5.1.0",
+		"@supabase/supabase-js": "^2.81.1",
+		"lucide": "^0.553.0"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-auto": "^7.0.0",

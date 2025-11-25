@@ -306,27 +306,67 @@ def separate_voiceline(input_path: str, uid: str):
     }
 
 
-def get_segmented_vocal_notes(audio_path, min_duration_sec=0.08, sr=44100, frame_length=1024, hop_length=128, cents_tolerance=25, silence_threshold_factor=0.35, merge_all_until_silence=True):
+def process_audio_task(input_path, uid, task_id):
+    """
+    Handles downloading, separating, and analyzing a YouTube video.
+    """
+    try:
+        progress_store[task_id] = "downloading"
+        # This function is present in your "older version" code
+        file_path = download_audio(input_path, uid)
+
+        progress_store[task_id] = "separating"
+        # This function is present in your "older version" code
+        result = separate_voiceline(file_path, uid)
+
+        progress_store[task_id] = "finalizing"
+        # optional short wait for finalization
+        sleep(1)
+
+        # store result in results_store and mark done
+        results_store[task_id] = result
+        progress_store[task_id] = "done"
+        logger.info(
+            f"Task {task_id} finished: vocals_path={result.get('vocals_path')}, notes={len(result.get('notes', []))}")
+        return result
+    except Exception as e:
+        # make sure client knows there was an error
+        progress_store[task_id] = "error"
+        results_store[task_id] = {"status": "error", "message": str(e)}
+        logger.exception(f"process_audio_task error for task {task_id}: {e}")
+        return None
+
+
+def manual_hz_to_cents(f1, f2):
+    """Calculate the musical difference in cents between two frequencies."""
+    if f1 <= 0 or f2 <= 0:
+        return np.nan  # Avoid division by zero or log of non-positive numbers
+    return 1200 * np.log2(f2 / f1)
+
+
+def get_segmented_vocal_notes(audio_path, min_duration_sec=0.08, sr=44100, frame_length=1024, hop_length=128, cents_tolerance=25, silence_threshold_factor=0.2, merge_all_until_silence=False):
     """
     Analyzes an isolated vocal line to produce a list of segmented musical notes.
     Uses a SLOW adaptive envelope to detect silence relative to the current phrase volume.
-
-    :param audio_path: Path to the audio file.
-    :param merge_all_until_silence: If True, ignores pitch changes and only breaks notes on silence.
-    :param silence_threshold_factor: Fraction of the local phrase volume to consider as silence (e.g. 0.2 = 20%).
     """
     if not audio_path:
         return []
 
+    # New Parameter: Looser confidence threshold for pitched sound detection
+    # Adjusted to allow complex, less certain pitches (Fix for "too harsh")
+    VOICED_PROB_THRESHOLD = 0.55
+
     # 1. Load Audio and PYIN Analysis
     y, sr = librosa.load(audio_path, sr=sr, mono=True)
 
+    # fmin changed to 100 to avoid librosa's 'less than two periods' UserWarning
     f0, voiced_flag, voiced_prob = librosa.pyin(
-        y, fmin=80, fmax=1100, sr=sr, frame_length=frame_length, hop_length=hop_length
+        y, fmin=100, fmax=1100, sr=sr, frame_length=frame_length, hop_length=hop_length
     )
 
     # Smoothing the Pitch (Median Filter)
-    f0_smoothed = medfilt(f0, kernel_size=5)
+    # ADJUSTED: kernel_size=9 for balance (smooths vibrato, allows quicker pitch changes)
+    f0_smoothed = medfilt(f0, kernel_size=9)
     frame_duration = hop_length / sr
 
     # --- ROBUST ADAPTIVE SILENCE DETECTION ---
@@ -334,16 +374,11 @@ def get_segmented_vocal_notes(audio_path, min_duration_sec=0.08, sr=44100, frame
     S = librosa.feature.rms(
         y=y, frame_length=frame_length, hop_length=hop_length)[0]
 
-    # Calculate "Phrase Baseline" using a LARGE median filter window.
-    # 1.5 seconds approx = 1.5 / frame_duration.
-    # At 44.1k/128 hop, frame_duration is ~0.0029s. 1.5s is ~517 frames.
-    # We ensure the kernel size is odd.
+    # Calculate "Phrase Baseline" using a LARGE median filter window (1.5s approx).
     long_window_size = int(1.5 / frame_duration)
     if long_window_size % 2 == 0:
         long_window_size += 1
 
-    # This establishes the "context volume" (how loud the current phrase is generally)
-    # It won't drop instantly when the singer breathes.
     PHRASE_BASELINE = medfilt(S, kernel_size=long_window_size)
 
     # Also calculate a global floor to prevent amplifying background noise during long silences
@@ -362,20 +397,21 @@ def get_segmented_vocal_notes(audio_path, min_duration_sec=0.08, sr=44100, frame
         time_sec = i * frame_duration
         current_rms = S[i]
 
-        # Dynamic Threshold: 20% (factor) of the recent phrase volume
-        # But never go below the global noise floor (plus a small buffer)
+        # Dynamic Threshold: Factor of the recent phrase volume
         local_threshold = max(
             PHRASE_BASELINE[i] * silence_threshold_factor, global_noise_floor * 1.5)
 
         # Check: Is this frame LOUD?
         is_loud_enough = (current_rms >= local_threshold)
 
-        # Check: Is this frame PITCHED?
+        # Check: Is this frame PITCHED and CONFIDENT? (Adjusted condition)
         is_pitched = (voiced and not np.isnan(freq_smoothed))
+        is_confident = (voiced_prob[i] > VOICED_PROB_THRESHOLD)
 
-        # We treat the frame as "Active Singing" if it is pitched AND loud enough.
-        # If merge_all_until_silence is True, we mainly care about loudness continuity.
-        if is_loud_enough and is_pitched:
+        # We treat the frame as "Active Singing" if it is Pitched AND Confident. (Removed absolute RMS floor)
+        is_active_singing = (is_pitched and is_confident)
+
+        if is_active_singing:
 
             if current_segment is None:
                 # Start new segment
@@ -416,12 +452,12 @@ def get_segmented_vocal_notes(audio_path, min_duration_sec=0.08, sr=44100, frame
                     segment_freqs = [freq_smoothed]
 
         else:
-            # --- POTENTIAL SILENCE / GAP ---
+            # --- POTENTIAL SILENCE / GAP / LOW-CONFIDENCE PITCH ---
 
             if current_segment is not None:
 
-                # If energy drops below the local threshold, it's a hard break (Silence)
-                if current_rms < local_threshold:
+                # If energy drops below the local dynamic threshold, it's a hard break (Silence)
+                if not is_loud_enough:
 
                     final_note_freq = np.mean(segment_freqs)
                     merged_notes.append({
@@ -434,7 +470,8 @@ def get_segmented_vocal_notes(audio_path, min_duration_sec=0.08, sr=44100, frame
                     segment_freqs = []
 
                 else:
-                    # It's not pitched (e.g. consonant) but it's still loud (part of the phrase).
+                    # It's not pitched/confident enough (e.g., consonant, or scream)
+                    # but it IS still loud (above local_threshold).
                     # Bridge the gap by extending the time, but don't add frequency (noise).
                     current_segment['end'] = time_sec + frame_duration
 

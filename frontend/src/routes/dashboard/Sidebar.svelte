@@ -193,7 +193,7 @@
         {:else if historyItems && historyItems.length > 0}
             {#each historyItems as item (item.id)}
                 <button
-                    class="w-full flex flex-col py-2 px-2 rounded-lg text-left"
+                    class="w-full flex flex-col py-2 px-2 rounded-lg text-left cursor-pointer"
                     on:click={() => openAnalysis(item)}
                     disabled={!item.has_data || item.id === "error"}
                 >
@@ -214,11 +214,6 @@
                                 </span>
                             {/if}
                         </div>
-                        {#if item.date}
-                            <span class="text-xs text-gray-400 ml-2 shrink-0">
-                                {formatDate(item.date)}
-                            </span>
-                        {/if}
                     </div>
                 </button>
             {/each}

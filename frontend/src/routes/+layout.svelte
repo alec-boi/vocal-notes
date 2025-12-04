@@ -40,8 +40,8 @@
   });
 </script>
 
-<header id="main-header">
-  <nav class="bg-white border-b-2 border-gray-200 pr-4 lg:pr-6 py-2.5">
+<header id="main-header" class="fixed left-0 right-0 top-0 w-full">
+  <nav class="bg-white w-full border-b-2 border-gray-200 pr-4 lg:pr-6 py-2.5">
     <div class="flex flex-wrap justify-between items-center">
       <div class="flex justify-center items-center gap-4">
         <button
@@ -120,7 +120,7 @@
   <div
     class="overflow-y-auto absolute bottom-0 h-full w-full py-5 px-3 bg-white border-r-2 border-gray-200"
   >
-    <ul class="h-[85%] pt-4 mb-4 space-y-2 border-b border-gray-400">
+    <ul class="pt-4 space-y-2">
       <li>
         <a
           href="/"
@@ -162,7 +162,7 @@
     </ul>
   </div>
   <div
-    class="hidden absolute bottom-0 left-0 justify-center p-4 space-x-4 w-full lg:flex bg-white z-20 border-r-2 border-gray-200"
+    class="absolute bottom-0 left-0 justify-center p-4 w-full bg-white border-r-2 border-gray-200"
   >
     <a
       href="/logout"
@@ -177,21 +177,25 @@
   </div>
 </aside>
 
-<div class="flex h-[calc(100vh-var(--header-height))] w-full">
-  <aside class="w-64 h-full border-r-2 border-gray-200 p-4">
+<div class="custom-sidebar-container flex flex-1 w-full min-h-screen">
+  <aside class="w-64 min-h-screen border-r-2 border-gray-200 p-4 pt-20">
     {#if $sidebarStore}
-      <svelte:component this={$sidebarStore} />
+      <svelte:component this={$sidebarStore} class="h-full" />
     {/if}
   </aside>
 
-  <main class="w-full flex-1 p-6">
+  <main class="w-full flex-1 p-6 mt-24">
     <slot />
   </main>
 </div>
 
 <style>
   :global(#default-sidebar) {
-    top: calc(var(--header-height));
+    top: var(--header-height);
     height: calc(100vh - var(--header-height));
+  }
+
+  #main-header {
+    z-index: 99999999;
   }
 </style>

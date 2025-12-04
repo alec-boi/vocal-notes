@@ -2,46 +2,13 @@
     import { supabase } from "$lib/subabaseClient";
     import { onMount, onDestroy } from "svelte";
     import Icon from "@iconify/svelte";
+    import AudioPlayer from "../../components/audioPlayer.svelte";
+    import { addAnalysis, currentAnalysis } from "$lib/analysisStore";
 
-    // authentication / session
     let user = null;
     let loading = true;
     let authToken = null;
 
-    onMount(async () => {
-        const { data: sessionData } = await supabase.auth.getSession();
-        const session = sessionData.session;
-        user = session?.user;
-
-        if (!user) {
-            window.location.href = "/login";
-            return;
-        }
-
-        authToken = session.access_token;
-        loading = false;
-    });
-
-    onDestroy(() => {
-        if (eventSource) {
-            eventSource.close();
-            eventSource = null;
-        }
-        if (pollInterval) clearInterval(pollInterval);
-        // remove audio listeners if any (defensive)
-        if (audioElem) {
-            audioElem.onloadedmetadata = null;
-            audioElem.ontimeupdate = null;
-            audioElem.onerror = null;
-        }
-    });
-
-    async function logout() {
-        await supabase.auth.signOut();
-        window.location.href = "/login";
-    }
-
-    // reactive searchbar state
     let youtubeLinkOrQuery = "";
     let isUrl = false;
     let searchResults = [];
@@ -51,21 +18,110 @@
 
     const youtubeRegex =
         /(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})(?:\S+)?/i;
-    const apiUrl = import.meta.env.VITE_API_URL.replace(/\/+$/, ""); // ensure no trailing slash
+    const apiUrl = import.meta.env.VITE_API_URL.replace(/\/+$/, "") || ""; // ensure no trailing slash
 
-    $: {
-        if (loading || !authToken) "";
+    $: analysisData = $currentAnalysis;
 
+    let analysisRunning = false;
+    let analysisError = null;
+    let notes = [];
+    let vocalsUrl = null;
+    let duration = 0;
+
+    $: if (analysisData && analysisData.id !== null) {
+        notes = analysisData.notes || [];
+        vocalsUrl = analysisData.vocalsUrl;
+    } else {
+        notes = [];
+        vocalsUrl = null;
+    }
+
+    let taskId = null;
+    let progress = null;
+    let eventSource = null;
+    let pollInterval = null;
+    let audioElem = null;
+    let activeIntervalIndex = -1;
+    let playUntilEnd = null;
+    const DEFAULT_MIN_DURATION = 0.1;
+    const MIN_WIDTH_PERCENT = 0.2;
+    const progressSteps = ["downloading", "separating", "finalizing", "done"];
+
+    onMount(async () => {
+        try {
+            const { data: sessionData } = await supabase.auth.getSession();
+            const session = sessionData.session;
+            user = session?.user;
+
+            if (!user) {
+                if (typeof window !== "undefined") {
+                    window.location.href = "/login";
+                }
+                return;
+            }
+
+            authToken = session.access_token;
+
+            if (typeof window !== "undefined") {
+                const refreshInterval = setInterval(
+                    async () => {
+                        const {
+                            data: { session: newSession },
+                        } = await supabase.auth.refreshSession();
+                        if (newSession?.session) {
+                            authToken = newSession.session.access_token;
+                            console.log("Token refreshed automatically");
+                        }
+                    },
+                    4.5 * 60 * 1000,
+                );
+
+                window.tokenRefreshInterval = refreshInterval;
+            }
+        } catch (err) {
+            console.error("Auth error:", err);
+            if (typeof window !== "undefined") {
+                window.location.href = "/login";
+            }
+            return;
+        } finally {
+            loading = false;
+        }
+    });
+
+    onDestroy(() => {
+        if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+        }
+        if (pollInterval) clearInterval(pollInterval);
+        if (audioElem) {
+            audioElem.onloadedmetadata = null;
+            audioElem.ontimeupdate = null;
+            audioElem.onerror = null;
+        }
+        if (typeof window !== "undefined" && window.tokenRefreshInterval) {
+            clearInterval(window.tokenRefreshInterval);
+            delete window.tokenRefreshInterval;
+        }
+    });
+
+    async function logout() {
+        await supabase.auth.signOut();
+        window.location.href = "/login";
+    }
+
+    $: if (youtubeLinkOrQuery && authToken) {
         const match = youtubeLinkOrQuery.match(youtubeRegex);
         const isUrlMatch = !!match;
 
         if (isUrlMatch) {
             isUrl = true;
             searchResults = [];
+            videoPreview = null;
             fetchVideoDetails(match[1]);
         } else {
             isUrl = false;
-            // only clear the preview when typing a query
             videoPreview = null;
 
             clearTimeout(searchDebounceTimeout);
@@ -86,7 +142,6 @@
             console.error("Token missing for fetchVideoDetails.");
             return;
         }
-
         try {
             isSearching = true;
             const res = await fetch(
@@ -98,16 +153,14 @@
 
             if (!res.ok) {
                 videoPreview = null;
-                const errorBody = await res.json().catch(() => ({}));
-                console.error(`API Error ${res.status}:`, errorBody);
-                throw new Error(
-                    errorBody.detail || "Could not fetch video details.",
-                );
+                const err = await res.json().catch(() => ({}));
+                console.error("API error:", err);
+                return;
             }
 
             videoPreview = await res.json();
-        } catch (error) {
-            console.error(error);
+        } catch (err) {
+            console.error("fetchVideoDetails error:", err);
         } finally {
             isSearching = false;
         }
@@ -118,8 +171,8 @@
             console.error("Token missing for searchYouTube.");
             return;
         }
-
         try {
+            isSearching = true;
             const res = await fetch(
                 `${apiUrl}/youtube/search?query=${encodeURIComponent(query)}`,
                 {
@@ -129,17 +182,15 @@
 
             if (!res.ok) {
                 searchResults = [];
-                const errorBody = await res.json().catch(() => ({}));
-                console.error(`API Error ${res.status}:`, errorBody);
-                throw new Error(
-                    errorBody.detail || "Could not perform search.",
-                );
+                const err = await res.json().catch(() => ({}));
+                console.error("Search API error:", err);
+                return;
             }
 
             const data = await res.json();
             searchResults = data.results || [];
-        } catch (error) {
-            console.error(error);
+        } catch (err) {
+            console.error("searchYouTube error:", err);
         } finally {
             isSearching = false;
         }
@@ -150,41 +201,7 @@
         searchResults = [];
     }
 
-    // API logic / progress / results
-    let analysisRunning = false;
-    let analysisError = null;
-    // notes will be an array of interval objects: { start, end, time, freq, note, left, width }
-    let notes = [];
-    let vocalsUrl = null;
-    let audioElem = null;
-    let duration = 0;
-    let taskId = null;
-    let progress = null;
-    let eventSource = null;
-    let pollInterval = null;
-
-    let activeIntervalIndex = -1; // which interval is currently playing
-    let playUntilEnd = null; // when set, audio should stop when reaching this time
-    const DEFAULT_MIN_DURATION = 0.1; // seconds when end missing
-    const MIN_WIDTH_PERCENT = 0.2; 
-    const progressSteps = ["downloading", "separating", "finalizing", "done"];
-
-    function formatTime(seconds) {
-        if (seconds == null || isNaN(Number(seconds))) return "0:00";
-        const s = Math.floor(Number(seconds));
-        const m = Math.floor(s / 60);
-        const sec = (s % 60).toString().padStart(2, "0");
-        return `${m}:${sec}`;
-    }
-
-    function progressPercentage(step) {
-        const index = progressSteps.indexOf(step);
-        if (index === -1) return 0;
-        return Math.round((index / (progressSteps.length - 1)) * 100);
-    }
-
-    // --- NEW: normalize backend intervals into guaranteed numeric start/end/time/freq/note
-    // Called inside fetchResult right after notes = data.notes || []
+    // --- normalization + geometry
     function normalizeIntervals(rawNotes) {
         if (!Array.isArray(rawNotes)) return [];
         const out = [];
@@ -211,10 +228,8 @@
         return out;
     }
 
-    // --- NEW: compute left/width percentages for each interval (call when duration available)
     function computeGeometry(intervals, audioDuration) {
         if (!audioDuration || audioDuration <= 0) {
-            // clear geometry if no duration
             intervals.forEach((i) => {
                 i.left = 0;
                 i.width = 0;
@@ -222,26 +237,23 @@
             return intervals;
         }
         return intervals.map((i) => {
-            // clamp times to audio duration
             const s = Math.max(0, Math.min(i.start, audioDuration));
             const e = Math.max(0, Math.min(i.end, audioDuration));
             const rawWidth = ((e - s) / audioDuration) * 100;
             const left = (s / audioDuration) * 100;
-            const width = Math.max(rawWidth, MIN_WIDTH_PERCENT); // enforce min vis width
+            const width = Math.max(rawWidth, MIN_WIDTH_PERCENT);
             return { ...i, start: s, end: e, time: s, left, width };
         });
     }
 
-    // --- NEW: audio timeupdate handler to highlight active interval and handle play-until-end
+    // --- audio event handlers + playback helpers
     let lastTimeUpdate = 0;
-    function handleTimeUpdate(e) {
+    function handleTimeUpdate() {
         if (!audioElem) return;
         const now = audioElem.currentTime;
-        // throttle to ~100ms
         if (performance.now() - lastTimeUpdate < 90) return;
         lastTimeUpdate = performance.now();
 
-        // find active interval
         let found = -1;
         for (let idx = 0; idx < notes.length; idx++) {
             const iv = notes[idx];
@@ -252,20 +264,16 @@
         }
         activeIntervalIndex = found;
 
-        // stop if requested
         if (playUntilEnd != null && now >= playUntilEnd) {
             audioElem.pause();
             playUntilEnd = null;
         }
     }
 
-    // --- NEW: when audio's metadata loads, set duration and compute geometry
     function handleAudioLoadedMetadata() {
         if (!audioElem) return;
         duration = audioElem.duration || 0;
-        // compute geometry now that duration known
         notes = computeGeometry(notes, duration);
-        // attach timeupdate listener (ensure idempotent)
         audioElem.ontimeupdate = handleTimeUpdate;
         audioElem.onerror = handleAudioError;
         console.log("audio duration:", duration, "intervals:", notes.length);
@@ -275,7 +283,6 @@
         console.error("Audio element error:", e);
     }
 
-    // play and optionally stop at interval end
     function playInterval(idx, stopAtEnd = true) {
         const iv = notes[idx];
         if (!iv || !audioElem) return;
@@ -284,7 +291,6 @@
         if (stopAtEnd) playUntilEnd = iv.end;
     }
 
-    // legacy playAt uses the same mechanism but doesn't set playUntilEnd
     function playAt(timeSeconds) {
         if (!audioElem) return;
         const t = Math.max(0, Math.min(timeSeconds, duration || timeSeconds));
@@ -293,28 +299,145 @@
         audioElem.play();
     }
 
-    // --- UPDATED fetchResult: normalize notes and compute absolute vocals URL
-    async function fetchResult(taskId) {
+    async function checkExistingAnalysis(youtubeUrl) {
         try {
-            const res = await fetch(`${apiUrl}/audio/result/${taskId}`, {
-                headers: { Authorization: `Bearer ${authToken}` },
+            // Extract video ID from URL for more reliable matching
+            const match = youtubeUrl.match(youtubeRegex);
+            const videoId = match ? match[1] : null;
+
+            let query = supabase
+                .from("audio_analyses")
+                .select("id, vocals_url, notes, created_at, original_url")
+                .eq("user_id", user.id)
+                .order("created_at", { ascending: false })
+                .limit(1);
+
+            // Try to match by video ID first (more reliable)
+            if (videoId) {
+                query = query.eq("video_id", videoId);
+            } else {
+                // Fallback to full URL match
+                query = query.eq("original_url", youtubeUrl);
+            }
+
+            const { data, error } = await query;
+
+            if (error) throw error;
+
+            if (data && data.length > 0) {
+                return data[0]; // Return the existing analysis
+            }
+            return null; // No existing analysis
+        } catch (err) {
+            console.error("Error checking existing analysis:", err);
+            return null;
+        }
+    }
+
+    function handleAnalysisSuccess(finalUrl, videoTitle, pitchNotes) {
+        const newAnalysisPayload = {
+            title: videoTitle,
+            vocalsUrl: finalUrl,
+            notes: pitchNotes,
+        };
+
+        addAnalysis(newAnalysisPayload);
+
+        vocalsUrl = finalUrl;
+        analysisRunning = false;
+    }
+
+    async function refreshTokenIfNeeded() {
+        const {
+            data: { session },
+        } = await supabase.auth.getSession();
+        if (session) {
+            // Check if token is about to expire (within 5 minutes)
+            const expiresAt = session.expires_at * 1000; // Convert to milliseconds
+            const now = Date.now();
+
+            if (expiresAt - now < 5 * 60 * 1000) {
+                // Less than 5 minutes left
+                console.log("Token about to expire, refreshing...");
+                const { data, error } = await supabase.auth.refreshSession();
+                if (error) {
+                    console.error("Failed to refresh token:", error);
+                    return false;
+                }
+                return true;
+            }
+        }
+        return true;
+    }
+
+    async function fetchResult(taskIdParam) {
+        try {
+            const tokenValid = await refreshTokenIfNeeded();
+            if (!tokenValid) {
+                console.error("Token invalid and could not refresh");
+                return null;
+            }
+
+            const {
+                data: { session },
+            } = await supabase.auth.getSession();
+            const currentToken = session?.access_token;
+
+            if (!currentToken) {
+                console.error("No auth token available");
+                return null;
+            }
+
+            const res = await fetch(`${apiUrl}/audio/result/${taskIdParam}`, {
+                headers: { Authorization: `Bearer ${currentToken}` },
             });
+
             if (res.status === 202) {
                 return null;
             }
+
             if (!res.ok) {
                 console.error("Failed to fetch result", await res.text());
                 return null;
             }
+
             const data = await res.json();
-            // normalize intervals (backend now returns start/end)
-            const raw = data.notes || [];
+
+            const supabaseId = data.supabase_id;
+            if (!supabaseId) {
+                console.error("No supabase_id in response");
+                return null;
+            }
+
+            const savedRes = await fetch(
+                `${apiUrl}/audio/saved_result/${supabaseId}`,
+                {
+                    headers: { Authorization: `Bearer ${currentToken}` },
+                },
+            );
+
+            if (!savedRes.ok) {
+                console.error(
+                    "Failed to fetch saved analysis",
+                    await savedRes.text(),
+                );
+                return null;
+            }
+
+            const savedData = await savedRes.json();
+
+            const analysisData = savedData;
+
+            if (!analysisData) {
+                console.error("No analysis data found");
+                return null;
+            }
+
+            const raw = analysisData.notes || [];
             const normalized = normalizeIntervals(raw);
-            // store normalized intervals in notes but WITHOUT geometry until duration known
             notes = normalized;
 
-            // IMPORTANT: make vocalsUrl absolute (point to backend), because backend returns "/files/..."
-            let returned = data.vocals_url || null;
+            let returned = analysisData.vocals_url || null;
             if (returned) {
                 if (/^https?:\/\//.test(returned)) {
                     vocalsUrl = returned;
@@ -325,9 +448,7 @@
                 vocalsUrl = null;
             }
 
-            // reset duration so geometry will be recomputed on next loadedmetadata
             duration = 0;
-            // clear active and playUntilEnd
             activeIntervalIndex = -1;
             playUntilEnd = null;
 
@@ -337,21 +458,21 @@
                 "normalized intervals:",
                 notes.length,
             );
-            return data;
+            return savedData;
         } catch (err) {
-            console.error(err);
+            console.error("fetchResult error:", err);
             return null;
         }
     }
 
-    // When user submits analysis (unchanged except it uses the updated fetchResult)
     async function startAnalysis(e) {
         e.preventDefault();
         analysisError = null;
         analysisRunning = true;
+        let existingAnalysis = null;
 
-        const selectedPreview = videoPreview; // capture before clearing
-        videoPreview = null; // hide preview visually
+        searchResults = [];
+        videoPreview = null;
 
         if (loading || !authToken) {
             analysisError = "Authentication not ready. Please wait.";
@@ -360,13 +481,43 @@
         }
 
         let urlToSend;
-        if (selectedPreview) {
-            urlToSend = `https://www.youtube.com/watch?v=${selectedPreview.id}`;
+        if (videoPreview) {
+            urlToSend = `https://www.youtube.com/watch?v=${videoPreview.id}`;
         } else if (youtubeLinkOrQuery) {
             urlToSend = youtubeLinkOrQuery;
         } else {
             console.log("No URL provided");
             analysisRunning = false;
+            return;
+        }
+
+        existingAnalysis = await checkExistingAnalysis(urlToSend);
+
+        if (existingAnalysis) {
+            console.log("Found existing analysis, loading from database...");
+
+            const raw = existingAnalysis.notes || [];
+            const normalized = normalizeIntervals(raw);
+            notes = normalized;
+
+            let returned = existingAnalysis.vocals_url || null;
+            if (returned) {
+                if (/^https?:\/\//.test(returned)) {
+                    vocalsUrl = returned;
+                } else {
+                    vocalsUrl = `${apiUrl}${returned.startsWith("/") ? "" : "/"}${returned}`;
+                }
+            } else {
+                vocalsUrl = null;
+            }
+
+            duration = 0;
+            activeIntervalIndex = -1;
+            playUntilEnd = null;
+
+            analysisRunning = false;
+            progress = "done";
+
             return;
         }
 
@@ -389,6 +540,57 @@
             }
 
             const data = await res.json();
+
+            if (data.supabase_id && data.task_id === "cached") {
+                console.log(
+                    "Backend returned cached analysis ID:",
+                    data.supabase_id,
+                );
+
+                await refreshTokenIfNeeded();
+                const {
+                    data: { session },
+                } = await supabase.auth.getSession();
+                const currentToken = session?.access_token;
+
+                const cachedRes = await fetch(
+                    `${apiUrl}/audio/saved_result/${data.supabase_id}`,
+                    {
+                        headers: { Authorization: `Bearer ${currentToken}` },
+                    },
+                );
+
+                if (!cachedRes.ok) {
+                    throw new Error("Failed to fetch cached analysis");
+                }
+
+                const analysisData = await cachedRes.json();
+
+                if (!analysisData) {
+                    throw new Error("No cached analysis data found");
+                }
+
+                const raw = analysisData.notes || [];
+                const normalized = normalizeIntervals(raw);
+                notes = normalized;
+
+                let returned = analysisData.vocals_url || null;
+                if (returned) {
+                    if (/^https?:\/\//.test(returned)) {
+                        vocalsUrl = returned;
+                    } else {
+                        vocalsUrl = `${apiUrl}${returned.startsWith("/") ? "" : "/"}${returned}`;
+                    }
+                }
+
+                duration = 0;
+                activeIntervalIndex = -1;
+                playUntilEnd = null;
+                analysisRunning = false;
+                progress = "done";
+                return;
+            }
+
             taskId = data.task_id;
             progress = "downloading";
 
@@ -396,18 +598,13 @@
                 eventSource.close();
             }
 
-            // Subscribe to SSE progress
             eventSource = new EventSource(`${apiUrl}/audio/progress/${taskId}`);
 
             eventSource.onmessage = async (event) => {
                 progress = event.data;
 
                 if (progress === "done") {
-                    // when SSE reports done, fetch the final result
-                    if (eventSource) {
-                        eventSource.close();
-                    }
-                    // attempt fetch once immediately; if not ready poll until available
+                    if (eventSource) eventSource.close();
                     const got = await fetchResult(taskId);
                     if (!got) {
                         startResultPoll(taskId);
@@ -422,7 +619,6 @@
                 if (eventSource) {
                     eventSource.close();
                 }
-                // try to poll results (in case SSE failed but processing completed)
                 startResultPoll(taskId);
                 analysisRunning = false;
             };
@@ -436,13 +632,12 @@
         }
     }
 
-    // Polling fallback: polls /audio/result every 1s until result available or timeout
-    function startResultPoll(taskId, timeoutMs = 30000) {
+    function startResultPoll(taskIdParam, timeoutMs = 30000) {
         let elapsed = 0;
         if (pollInterval) clearInterval(pollInterval);
         pollInterval = setInterval(async () => {
             elapsed += 1000;
-            const got = await fetchResult(taskId);
+            const got = await fetchResult(taskIdParam);
             if (got) {
                 clearInterval(pollInterval);
                 pollInterval = null;
@@ -455,30 +650,52 @@
             }
         }, 1000);
     }
+
+    function formatTime(seconds) {
+        if (seconds == null || isNaN(Number(seconds))) return "0:00";
+        const s = Math.floor(Number(seconds));
+        const m = Math.floor(s / 60);
+        const sec = (s % 60).toString().padStart(2, "0");
+        return `${m}:${sec}`;
+    }
+
+    function progressPercentage(step) {
+        const index = progressSteps.indexOf(step);
+        if (index === -1) return 0;
+        return Math.round((index / (progressSteps.length - 1)) * 100);
+    }
+
+    function onPlayerElement(event) {
+        const el = event.detail?.element;
+        if (!el) return;
+        audioElem = el;
+
+        // attach metadata handler (we want to compute geometry once duration known)
+        audioElem.onloadedmetadata = () => {
+            handleAudioLoadedMetadata();
+        };
+        audioElem.ontimeupdate = handleTimeUpdate;
+        audioElem.onerror = handleAudioError;
+
+        // if already has metadata ready
+        if (audioElem.readyState >= 1) {
+            handleAudioLoadedMetadata();
+        }
+    }
 </script>
 
-<div class="flex flex-col flex-grow gap-6">
-    <h1 class="text-center text-6xl text-capitalize text-fuchsia-400 font-bold">
-        Paste Your Link
-    </h1>
+<div class="w-full my-auto bg-white">
+    {#if !vocalsUrl}
+        <h1
+            class="pb-8 text-center text-6xl text-capitalize text-fuchsia-400 font-bold"
+        >
+            Paste Your Link
+        </h1>
 
-    {#if loading}
-        <div class="flex items-center justify-center p-8">
-            <Icon
-                icon="mdi:loading"
-                class="animate-spin w-10 h-10 text-fuchsia-400"
-            />
-            <span class="ml-3 text-lg text-gray-600"
-                >Loading authentication...</span
-            >
-        </div>
-    {:else}
         <form
             on:submit={startAnalysis}
-            class="flex items-start w-1/2 max-w-3xl mx-auto space-x-2"
+            class="flex items-start w-1/2 max-w-3xl mx-auto space-x-2 mb-6"
         >
-            <label for="simple-search" class="sr-only">Search</label>
-
             <div class="relative w-full">
                 <div
                     class="absolute inset-y-0 start-0 flex items-center justify-center w-14 pointer-events-none"
@@ -557,7 +774,7 @@
                         </div>
                     {/if}
 
-                    {#if searchResults.length > 0 && !isUrl}
+                    {#if !analysisRunning && searchResults.length > 0 && !isUrl}
                         <ul
                             class="divide-y divide-gray-100 max-h-80 overflow-y-auto"
                         >
@@ -585,7 +802,7 @@
                         </ul>
                     {/if}
 
-                    {#if progress}
+                    {#if analysisRunning || progress}
                         <div class="progress-wrapper p-2">
                             {#if progress !== "done"}
                                 <div class="flex justify-start m-2">
@@ -643,161 +860,116 @@
                 </p>
             </div>
         {/if}
+    {:else}
+        <div class="w-full bg-white">
+            <h1 class="font-bold text-5xl text-fuchsia-400 mb-2">
+                Vocal Results
+            </h1>
 
-        {#if vocalsUrl}
-            <div
-                class="mt-6 w-1/2 max-w-3xl mx-auto bg-white rounded shadow p-4"
-            >
-                <h3 class="font-semibold mb-2">Vocals</h3>
-                <audio
-                    bind:this={audioElem}
-                    controls
-                    src={vocalsUrl}
-                    class="w-full"
-                    on:loadedmetadata={handleAudioLoadedMetadata}
-                    on:error={handleAudioError}
-                ></audio>
-
-                {#if notes && notes.length > 0}
-                    <div class="mt-4">
-                        <h4 class="text-sm font-medium mb-2">
-                            Detected notes timeline
-                        </h4>
-
-                        <!-- Timeline bar -->
-                        <div
-                            class="relative w-full h-12 bg-gray-100 rounded overflow-visible"
-                            style="padding: 8px;"
-                        >
-                            <!-- waveform placeholder / background bar -->
-                            <div
-                                class="absolute left-2 right-2 top-1 bottom-1 bg-white rounded shadow-sm"
-                            ></div>
-
-                            <!-- intervals rendered as positioned blocks -->
+            {#if notes && notes.length > 0}
+                <div class="mt-4">
+                    <AudioPlayer
+                        src={vocalsUrl}
+                        on:element={onPlayerElement}
+                        bind:this={audioElem}
+                    >
+                        <div slot="timeline">
                             {#each notes as note, i}
-                                <button
-                                    class="timeline-interval"
-                                    on:click={() => playInterval(i, true)}
-                                    role="button"
-                                    tabindex="0"
-                                    aria-label={`Play ${note.note} from ${formatTime(note.start)} to ${formatTime(note.end)}`}
-                                    title={`${note.note} — ${formatTime(note.start)} → ${formatTime(note.end)}`}
+                                <div
+                                    class="timeline-interval absolute top-1/2 transform -translate-y-1/2"
                                     style="left: {note.left}%; width: {note.width}%;"
                                 >
-                                    <span class="interval-label"
-                                        >{note.note}</span
+                                    <button
+                                        class="interval-btn w-full h-full flex items-center justify-center text-xs font-semibold"
+                                        on:click={() => playInterval(i)}
+                                        aria-label={`Play ${note.note} from ${note.start} to ${note.end}`}
+                                        title={`${note.note} — ${note.start} → ${note.end}`}
                                     >
-                                </button>
-                            {/each}
-
-                            <!-- active highlight overlay (optional visual) -->
-                            {#if activeIntervalIndex >= 0}
-                                <!-- nothing extra needed, CSS .active handled below -- we toggle via class binding if desired -->
-                            {/if}
-                        </div>
-
-                        <!-- compact list under timeline -->
-                        <ul class="mt-3 divide-y">
-                            {#each notes as note, i}
-                                <li
-                                    class="py-2 flex items-center justify-between"
-                                >
-                                    <div>
-                                        <div class="text-sm font-medium">
-                                            {note.note}
-                                        </div>
-                                        <div class="text-xs text-gray-500">
-                                            {formatTime(note.start)} — {formatTime(
-                                                note.end,
-                                            )} • {note.freq
-                                                ? note.freq.toFixed(1)
-                                                : "-"} Hz
-                                        </div>
-                                    </div>
-                                    <div>
-                                        <button
-                                            class="px-2 py-1 bg-fuchsia-400 text-white rounded"
-                                            on:click={() =>
-                                                playInterval(i, true)}
-                                            >▶</button
+                                        <span class="interval-label"
+                                            >{note.note}</span
                                         >
-                                    </div>
-                                </li>
+                                    </button>
+                                </div>
                             {/each}
-                        </ul>
-                    </div>
-                {:else}
-                    <p class="text-sm text-gray-500 mt-3">No notes detected.</p>
-                {/if}
-            </div>
-        {/if}
+                        </div>
+                    </AudioPlayer>
+
+                    <h4 class="text-sm font-medium mb-2">
+                        Detected notes timeline
+                    </h4>
+
+                    <ul class="mt-3 divide-y divide-gray-200">
+                        {#each notes as note, i}
+                            <li class="py-2 flex items-center justify-between">
+                                <div>
+                                    <div class="text-sm font-medium">
+                                        {note.note}
+                                    </div>
+                                    <div class="text-xs text-gray-500">
+                                        {formatTime(note.start)} — {formatTime(
+                                            note.end,
+                                        )} • {note.freq
+                                            ? note.freq.toFixed(1)
+                                            : "-"} Hz
+                                    </div>
+                                </div>
+                                <div>
+                                    <button
+                                        class="px-2 py-1 text-fuchsia-400 cursor-pointer"
+                                        on:click={() => playInterval(i, true)}
+                                    >
+                                        <Icon
+                                            icon="material-symbols:play-arrow-rounded"
+                                            class="w-8 h-8"
+                                        />
+                                    </button>
+                                </div>
+                            </li>
+                        {/each}
+                    </ul>
+                </div>
+            {:else}
+                <p class="text-sm text-gray-500 mt-3">No notes detected.</p>
+            {/if}
+        </div>
     {/if}
 </div>
 
 <style>
-    .glass-progress-bar {
-        position: relative;
-        background: linear-gradient(90deg, #e879f9 80%, #e879f9 100%);
+    .timeline-interval {
+        height: 48%;
+        background: rgba(232, 121, 249, 0.95);
+        border-radius: 6px;
         overflow: hidden;
-    }
-    .glass-progress-bar .shine {
+        min-width: 6px;
+        z-index: 11;
         position: absolute;
-        top: 0;
-        left: -100%;
-        width: 50%;
-        height: 100%;
-        clip-path: polygon(20% 0, 100% 0, 80% 100%, 0% 100%);
-        pointer-events: none;
-        background: linear-gradient(
-            90deg,
-            rgba(255, 255, 255, 0.5) 0%,
-            rgba(255, 255, 255, 0.45) 100%
-        );
-        animation: shine-move 1s infinite linear;
-    }
-    @keyframes shine-move {
-        0% {
-            left: -100%;
-        }
-        100% {
-            left: 100%;
-        }
+        top: 1.25rem;
     }
 
-    /* Timeline interval styles */
-    .timeline-interval {
-        position: absolute;
-        top: 50%;
-        transform: translateY(-50%);
-        height: 48%; /* visually fit inside bar padding */
-        background: rgba(232, 121, 249, 0.95); /* fuchsia-400 */
-        border-radius: 6px;
-        color: white;
+    :global(.interval-btn) {
+        background: transparent;
+        color: #fff;
+        padding: 0 6px;
+        height: 100%;
+        width: 100%;
         display: flex;
         align-items: center;
         justify-content: center;
-        padding: 0 6px;
-        font-size: 10px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        min-width: 6px; /* ensure visible even for tiny intervals */
-        border: 1px solid rgba(0, 0, 0, 0.08);
         cursor: pointer;
     }
-    .timeline-interval:focus {
+
+    :global(.interval-btn:focus) {
         outline: 2px solid rgba(232, 121, 249, 0.6);
     }
+
     .interval-label {
         pointer-events: none;
         font-weight: 600;
+        font-size: 10px;
     }
 
-    /* small-screen adjustments */
-    @media (max-width: 640px) {
-        .glass-progress-bar {
-            font-size: 10px;
-        }
+    .glass-progress-bar {
+        background: linear-gradient(90deg, #a855f7, #f472b6);
     }
 </style>

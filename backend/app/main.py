@@ -58,7 +58,8 @@ app = FastAPI(title="AudioAnalysis API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5671",
+                   "https://localhost:5671", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -101,8 +102,16 @@ def verify_token(authorization: str = Header(...)):
         user = supabase.auth.get_user(token)
         return user.user
 
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    except Exception as e:
+        logger.error(f"Token verification failed: {str(e)}")
+
+        error_msg = str(e).lower()
+        if "invalid jwt" in error_msg or "jwt expired" in error_msg or "invalid token" in error_msg:
+            raise HTTPException(
+                status_code=401, detail="Token expired or invalid")
+        else:
+            raise HTTPException(
+                status_code=401, detail="Invalid or expired token")
 
 
 security = HTTPBearer()
@@ -115,8 +124,33 @@ def logout():
 
 @app.post("/audio/process")
 def process_audio(payload: UrlPayload, user=Depends(verify_token)):
+    # First check if this URL was already processed for this user
+    try:
+        service_role_supabase = create_client(
+            SUPABASE_URL, SUPABASE_SERVICE_ROLE)
+
+        existing = service_role_supabase.table('audio_analyses').select(
+            "id, vocals_url, notes, created_at"
+        ).eq("user_id", user.id).eq("original_url", payload.url).execute()
+
+        if hasattr(existing, 'data'):
+            existing_data = existing.data
+        else:
+            existing_data = existing[1] if isinstance(
+                existing, tuple) and len(existing) > 1 else []
+
+        # If exists, return the existing analysis ID immediately
+        if existing_data:
+            logger.info(
+                f"Found existing analysis for user {user.id}, URL: {payload.url}")
+            return {"task_id": "cached", "supabase_id": existing_data[0]['id']}
+
+    except Exception as e:
+        logger.warning(f"Error checking for existing analysis: {e}")
+        # Continue with processing if check fails
+
+    # If not cached, create a new task
     task_id = str(uuid.uuid4())
-    # initialize stores
     progress_store[task_id] = None
     results_store[task_id] = None
 
@@ -127,32 +161,6 @@ def process_audio(payload: UrlPayload, user=Depends(verify_token)):
     thread.start()
     logger.info(f"Started processing task {task_id} for user {user.id}")
     return {"task_id": task_id}
-
-
-def process_audio_task(input_path, uid, task_id):
-    try:
-        progress_store[task_id] = "downloading"
-        file_path = download_audio(input_path, uid)
-
-        progress_store[task_id] = "separating"
-        result = separate_voiceline(file_path, uid)
-
-        progress_store[task_id] = "finalizing"
-        # optional short wait for finalization
-        sleep(1)
-
-        # store result in results_store and mark done
-        results_store[task_id] = result
-        progress_store[task_id] = "done"
-        logger.info(
-            f"Task {task_id} finished: vocals_path={result.get('vocals_path')}, notes={len(result.get('notes', []))}")
-        return result
-    except Exception as e:
-        # make sure client knows there was an error
-        progress_store[task_id] = "error"
-        results_store[task_id] = {"status": "error", "message": str(e)}
-        logger.exception(f"process_audio_task error for task {task_id}: {e}")
-        return None
 
 
 @app.get("/audio/progress/{task_id}")
@@ -166,50 +174,158 @@ async def progress_stream(task_id: str):
 @app.get("/audio/result/{task_id}")
 def audio_result(task_id: str, user=Depends(verify_token)):
     """
-    Return stored result for a finished task.
-    MODIFIED: Now returns the raw, unfiltered notes directly from the detection function.
+    Return the Supabase ID for a completed task, or a 202 if still processing.
     """
     result = results_store.get(task_id)
+    status = progress_store.get(task_id)
+
     if not result:
-        # if still in progress return 202
-        status = progress_store.get(task_id)
-        if status and status != "done":
+        if status and status != "done" and status != "error":
             return JSONResponse(status_code=202, content={"status": "processing"})
-        raise HTTPException(status_code=404, detail="Result not available")
+        raise HTTPException(
+            status_code=404, detail="Result not available or task failed.")
 
-    # result is the dict returned by separate_voiceline
-    vocals_path = result.get("vocals_path")
-    vocals_url = None
-    if vocals_path:
-        try:
-            p = Path(vocals_path).resolve()
-            if not p.exists():
-                # helpful debug log for missing file
-                logger.warning(
-                    f"Requested vocals_path does not exist on disk: {p}")
-                vocals_url = None
-            else:
-                rel = p.relative_to(AUDIO_OUTPUT_DIR.resolve())
-                vocals_url = f"/files/{rel.as_posix()}"
-        except Exception as exc:
-            logger.exception(
-                f"Error making vocals_url for task {task_id}: {exc}")
-            vocals_url = None
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail=result.get(
+            "message", "Task failed."))
 
-    # notes are the raw frames returned by get_raw_note_frames
-    notes = result.get("notes", []) or []
-
-    # Ensure 'time' key is present for backward compatibility
-    final_notes = []
-    for note in notes:
-        note["time"] = note["start"]
-        final_notes.append(note)
+    # Result now contains the Supabase ID, not the raw data
+    supabase_id = result.get("supabase_id")
 
     return {
-        "status": result.get("status", "done"),
-        "vocals_url": vocals_url,
-        "notes": final_notes,
+        "status": "done",
+        "supabase_id": supabase_id,  # Return the ID for the client to fetch the saved result
     }
+
+
+@app.get("/audio/sidebar_recent", dependencies=[Depends(security)])
+def get_sidebar_recent(user=Depends(verify_token), limit: int = Query(5, ge=1, le=10)):
+    """Get recent analyses for the sidebar"""
+    try:
+        # Add cache control headers
+        from fastapi import Response
+        response = Response()
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+
+        result = supabase.table('audio_analyses').select(
+            "id, original_url, created_at, video_id"
+        ).eq(
+            "user_id", user.id
+        ).order(
+            "created_at", desc=True
+        ).limit(limit).execute()  # Get multiple items
+
+        if hasattr(result, 'data'):
+            data = result.data
+        elif isinstance(result, tuple) and len(result) > 1:
+            data = result[1]
+        else:
+            data = result
+
+        recent_items = []
+
+        for item in data:
+            url = item['original_url']
+            video_id = item.get('video_id')
+
+            # Default values
+            title = "Audio Analysis"
+            artist = "Unknown Source"
+
+            # Try to get YouTube info if available
+            if video_id and YOUTUBE_API_KEY:
+                try:
+                    youtube_url = "https://www.googleapis.com/youtube/v3/videos"
+                    params = {
+                        "part": "snippet",
+                        "id": video_id,
+                        "key": YOUTUBE_API_KEY,
+                    }
+                    youtube_response = requests.get(
+                        youtube_url, params=params, timeout=3)
+
+                    if youtube_response.ok:
+                        youtube_data = youtube_response.json()
+                        if youtube_data.get('items'):
+                            snippet = youtube_data['items'][0]['snippet']
+                            title = snippet.get('title', 'YouTube Video')
+                            artist = snippet.get('channelTitle', 'YouTube')
+                except:
+                    # If YouTube API fails, use fallback
+                    title = f"YouTube Video ({video_id[:8]}...)"
+                    artist = "YouTube"
+            else:
+                # Extract from URL
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                domain = parsed.netloc.replace('www.', '')
+
+                if 'youtube.com' in domain or 'youtu.be' in domain:
+                    title = "YouTube Video"
+                    artist = "YouTube"
+                elif domain:
+                    title = domain.split('.')[0].title(
+                    ) if '.' in domain else domain
+                    artist = domain
+
+            recent_items.append({
+                "id": item['id'],
+                "title": title[:40] + "..." if len(title) > 40 else title,
+                "artist": artist[:30] + "..." if len(artist) > 30 else artist,
+                "date": item['created_at'],
+                "has_data": True
+            })
+
+        return {"recent_items": recent_items, "count": len(recent_items)}
+
+    except Exception as e:
+        logger.warning(f"Error fetching sidebar recent: {e}")
+        return {"recent_items": [], "count": 0, "error": str(e)}
+
+
+@app.get("/audio/saved_result/{analysis_id}")
+def get_saved_analysis(analysis_id: str, user=Depends(verify_token)):
+    """
+    Retrieves a single saved audio analysis result from Supabase by ID.
+    """
+    try:
+        result = supabase.table('audio_analyses').select(
+            "vocals_url, notes, original_url, created_at, id"
+        ).eq(
+            "id", analysis_id
+        ).eq(
+            "user_id", user.id
+        ).execute()
+
+        # Extract data from response
+        if hasattr(result, 'data'):
+            data = result.data
+        elif isinstance(result, tuple) and len(result) > 1:
+            data = result[1]
+        else:
+            data = result
+
+        if not data:
+            raise HTTPException(
+                status_code=404, detail="Analysis not found or unauthorized.")
+
+        # Get the first (and should be only) item from the array
+        analysis = data[0] if isinstance(
+            data, list) and len(data) > 0 else data
+
+        # Return as a single object, not an array
+        return {
+            "id": analysis.get("id"),
+            "vocals_url": analysis.get("vocals_url"),
+            "notes": analysis.get("notes", []),
+            "original_url": analysis.get("original_url"),
+            "created_at": analysis.get("created_at")
+        }
+
+    except Exception as e:
+        logger.exception(f"Error fetching saved analysis {analysis_id}: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Database error: {str(e)}")
 
 
 def download_audio(url: str, uid: str) -> str:
@@ -305,32 +421,93 @@ def separate_voiceline(input_path: str, uid: str):
         "notes": notes
     }
 
+# --- UPDATED FUNCTION: SAVE TO SUPABASE ---
+
+
+def save_analysis_to_supabase(uid: str, original_url: str, vocals_path: str, notes: list):
+    """
+    Saves the final analysis result to the Supabase database.
+    Returns the Supabase record ID.
+    """
+    import re
+
+    # Extract YouTube video ID for easier matching
+    video_id = None
+    youtube_regex = r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})'
+    match = re.search(youtube_regex, original_url)
+    if match:
+        video_id = match.group(1)
+
+    service_role_supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE)
+
+    # Convert file path to relative URL
+    vocals_url_path = Path(vocals_path).relative_to(
+        AUDIO_OUTPUT_DIR.resolve()).as_posix()
+    vocals_url = f"/files/{vocals_url_path}"
+
+    try:
+        response = service_role_supabase.table('audio_analyses').insert({
+            "user_id": uid,
+            "original_url": original_url,
+            "video_id": video_id,  # Store video ID for easier matching
+            "vocals_url": vocals_url,
+            "notes": notes,
+        }).execute()
+
+        inserted_data = response.data
+
+        if inserted_data and len(inserted_data) > 0:
+            record_id = inserted_data[0]['id']
+            logger.info(
+                f"Successfully saved analysis to Supabase. Record ID: {record_id}")
+            return str(record_id)
+        else:
+            raise Exception("Supabase insert returned no data.")
+
+    except Exception as e:
+        logger.exception(f"Error saving analysis to Supabase: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Database error: {str(e)}")
+
+# --- UPDATED FUNCTION: process_audio_task ---
+
 
 def process_audio_task(input_path, uid, task_id):
     """
-    Handles downloading, separating, and analyzing a YouTube video.
+    Handles downloading, separating, analyzing, and SAVING to Supabase.
     """
     try:
         progress_store[task_id] = "downloading"
-        # This function is present in your "older version" code
         file_path = download_audio(input_path, uid)
 
         progress_store[task_id] = "separating"
-        # This function is present in your "older version" code
-        result = separate_voiceline(file_path, uid)
+        # The result dict now contains the raw vocals_path and notes
+        analysis_result = separate_voiceline(file_path, uid)
+
+        vocals_path = analysis_result.get("vocals_path")
+        notes = analysis_result.get("notes", [])
+
+        if not vocals_path:
+            raise Exception("Separation failed, no vocal file created.")
+
+        progress_store[task_id] = "saving"
+        # 💡 NEW STEP: Save results to database. Returns the new Supabase record ID.
+        supabase_id = save_analysis_to_supabase(
+            uid, input_path, vocals_path, notes
+        )
 
         progress_store[task_id] = "finalizing"
-        # optional short wait for finalization
         sleep(1)
 
-        # store result in results_store and mark done
-        results_store[task_id] = result
+        # 💡 CRITICAL CHANGE: results_store now holds the Supabase ID, not the raw data.
+        results_store[task_id] = {"supabase_id": supabase_id}
         progress_store[task_id] = "done"
+
         logger.info(
-            f"Task {task_id} finished: vocals_path={result.get('vocals_path')}, notes={len(result.get('notes', []))}")
-        return result
+            f"Task {task_id} finished and saved as Supabase ID: {supabase_id}")
+        return {"supabase_id": supabase_id}
+
     except Exception as e:
-        # make sure client knows there was an error
         progress_store[task_id] = "error"
         results_store[task_id] = {"status": "error", "message": str(e)}
         logger.exception(f"process_audio_task error for task {task_id}: {e}")
@@ -340,11 +517,11 @@ def process_audio_task(input_path, uid, task_id):
 def manual_hz_to_cents(f1, f2):
     """Calculate the musical difference in cents between two frequencies."""
     if f1 <= 0 or f2 <= 0:
-        return np.nan  # Avoid division by zero or log of non-positive numbers
+        return np.nan
     return 1200 * np.log2(f2 / f1)
 
 
-def get_segmented_vocal_notes(audio_path, min_duration_sec=0.08, sr=44100, frame_length=1024, hop_length=128, cents_tolerance=25, silence_threshold_factor=0.2, merge_all_until_silence=False):
+def get_segmented_vocal_notes(audio_path, min_duration_sec=0.08, sr=44100, frame_length=1024, hop_length=128, cents_tolerance=25, silence_threshold_factor=0.2, merge_all_until_silence=True):
     """
     Analyzes an isolated vocal line to produce a list of segmented musical notes.
     Uses a SLOW adaptive envelope to detect silence relative to the current phrase volume.
